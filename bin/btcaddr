@@ -1,0 +1,66 @@
+#!/usr/bin/perl
+
+=head1 NAME
+
+btcaddr - get bitcoin addresses from private keys
+
+=head1 SYNOPSIS
+
+    btcaddr [OPTIONS] < WIFKEY
+
+    OPTIONS
+    -K         Suppress printing of the private key.
+
+=head1 DESCRIPTION
+
+btcaddr reads bitcoin private keys in Wallet Import Format on
+standard input, and prints them with 
+their addresses to standard output.
+
+Output fields are separated by spaces, and records are separated by
+newlines.  Fields can be selected and deselected with options.  No
+matter which fields are selected, the order for any selected fields
+is the same: private
+key in Wallet Import Format, uncompressed address, compressed address.
+
+FIXME: maybe remove option for compressed addresses, and have a 
+separate program for that.
+
+=head2 OPTIONS
+
+=over 4
+
+=item -K
+
+Suppress printing of the private key.
+
+=back
+
+=head1 SEE ALSO
+
+btcgenkey(1), btcspw(1)
+
+=cut
+
+use feature 'say';
+use strict;
+use warnings FATAL => 'all';
+
+use Bitcoin::Key;
+use Getopt::Long qw(:config bundling no_ignore_case require_order);
+use Pod::Usage qw(pod2usage);
+
+my $print_key = 1;
+my $no_print_key;
+
+GetOptions('K' => \$no_print_key) or pod2usage(-exitval => 64);
+
+$no_print_key and $print_key = 0;
+
+while (<>) {
+  chomp;
+  my $key = Bitcoin::Key->new(wif => $_);
+
+  $print_key and print "$key ";
+  say $key->address;
+}

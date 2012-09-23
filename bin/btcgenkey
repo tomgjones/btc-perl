@@ -1,0 +1,68 @@
+#!/usr/bin/perl
+
+=head1 NAME
+
+btcgenkey
+
+=head1 SYNOPSIS
+
+    btcgenkey [N]
+
+    N is the number of keys to generate.
+
+=head1 DESCRIPTION
+
+Generates random bitcoin keys and prints them, in Wallet Import Format,
+to standard output, followed by newlines.
+
+If the argument N is given, then N keys will be generated.  The default
+is to generate a single key.
+
+=head1 SEE ALSO
+
+btcaddr(1), btcspw(1)
+
+=cut
+
+use feature 'say';
+use strict;
+use warnings FATAL => 'all';
+
+use Bitcoin::Key;
+use Getopt::Long;
+use Pod::Usage qw(pod2usage);
+
+# Defaults.
+
+my $n = 1;
+my $debug = 0;
+
+# Parse arguments.
+
+GetOptions('d' => \$debug) or pod2usage(-verbose => 0, -exitval => 64);
+
+my $N = shift @ARGV;
+if (defined($N)) {
+  if ($N =~ /^\d+$/) {
+    $n = $N;
+  }
+  else {
+    pod2usage(-verbose => 0, -exitval => 64,
+	      -message => "N must be an integer");
+  }
+}
+@ARGV and  pod2usage(-verbose => 0, -exitval => 64,
+		     -message => "too many arguments");
+
+# We want the user to be able to monitor progress, even if they're running
+# this in a pipeline.
+
+STDOUT->autoflush(1);
+
+# Generate the keys.
+
+for (my $i = 0; $i < $n; $i++) {
+  my $key = Bitcoin::Key->new;
+  say $key;
+  $debug and print STDERR "btcgenkey debug: $key\n";
+}

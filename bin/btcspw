@@ -1,0 +1,399 @@
+#!/usr/bin/perl
+
+=head1 NAME
+
+btcspw - Make a new bitcoin paper wallet with split keys.
+
+=head1 SYNOPSIS
+
+    btcspw [OPTIONS] [X] [M] [N]
+
+    OPTIONS
+    
+    -n,--name=NAME       Give wallet name, to appear in page titles.
+
+=head1 DESCRIPTION
+
+btcspw generates a paper Bitcoin wallet, split across multiple
+sheets using Shamir's Secret Sharing Scheme, in HTML format, and
+writes it to standard output.
+
+The output format includes the address and shares of the WIF-format
+private key, along with QR codes for each.  Each share of the wallet
+is labelled with a title, and each private key share is labelled with
+its share number, the total number of shares for this wallet, and 
+the threshold of shares required to reconstruct the private key.
+
+X is the number of keys and addresses to generate.  Defaults to 1.
+
+M and N are the number of parts needed to reconstruct the private keys,
+and the total number of parts to split the keys into, respectively.
+Think "M of N secret sharing".
+
+M defaults to 2.  N defaults to N + 1.  The minimum values for M and
+N are both 2, and it doesn't make sense to have M greater than N.
+
+The current implementation will tend to emit warnings such as
+
+    WARNING: couldn't get memory lock (ENOMEM, try to adjust RLIMIT_MEMLOCK!).
+
+due to its use of ssss(1).
+
+=head1 SECURITY CONSIDERATIONS
+
+This section describes some security considerations that are
+specific to this program, and doesn't give general advice
+about managing Bitcoin paper wallets or cryptographic secret 
+sharing.
+
+Generated private keys and addresses should always be verified using
+an independent application before sending any money to the generated
+addresses.
+
+This program is intended to work well on a computer that's not on
+any networks.
+
+To avoid complete copies of the key information being created
+in non-volatile storage on the computer where btcspw is run,
+a couple of tips can be followed.  Firstly, ensure any swap space
+is encrypted and is reinitialised every boot with a random key.
+Secondly, create the HTML file in a tmpfs or a similar in-memory
+filesystem.  Thirdly, render the file in a browser using a
+uid that doesn't have write access to its own home directory, or to
+anywhere else where the browser might attempt to store cache or other
+state.
+
+Remember to take the security of the printer into account.
+
+=head1 SEE ALSO
+
+btcgenkey(1), btcaddr(1)
+
+https://www.bitaddress.org/
+
+=cut
+
+use feature 'say';
+use strict;
+
+use File::Slurp qw(read_file);
+use Getopt::Long qw(:config bundling no_ignore_case require_order);
+use IO::Handle;
+use IO::Pipe;
+use IPC::Run qw(run);
+use Pod::Usage qw(pod2usage);
+use Template;
+use URI;
+
+## Some constants.  When this is turned into a proper package, could consider
+## keeping the templates in separate files.
+my $doc = <<'EOT';
+<html>
+ <head>
+  <style type="text/css">
+
+.walletpart {margin-bottom: 3em; page-break-after:always}
+h1 {font-family: helvetica, arial, sans-serif; margin-bottom: 1.5em}
+
+.values {font-size: 85%;  font-family: Courier New;}
+td, table.inner {height: 100%;}
+td, tr, img {padding: 0; margin: 0;}
+table {border-collapse: collapse}
+
+/* doesn't seem to work */
+tr.addrtext {vertical-align: top; margin-right: 4em;}
+
+div.addrtext {margin-left: 0.5em; margin-right: 5em; margin-top: 0.5em}
+div.wiftext {margin-right: 0.5em; margin-left: 5em; margin-bottom: 0.5em}
+td.wif {vertical-align: bottom; text-align: right;}
+
+.record {border: 2px solid black;}
+img.pubqr {border-right: 1px solid black; border-bottom: 1px solid black}
+img.privqr {border-left: 1px solid black}
+.pubqr {vertical-align: top}
+tr.sep {height: 1.5em}
+
+  </style>
+  <title>
+   Bitcoin wallet [% IF d.defined('name') -%]"[% d.name %]" [% END %]for [% d.keys %] keys split for [% d.M %] of [% d.N %] recovery
+  </title>
+ </head>
+ <body>
+[% FOR part IN d.parts -%]
+  <h1>Paper Wallet Part [% part.0.partno %] of [% d.N %]</h1>
+  <div class="walletpart">
+   <table class="values page">
+    [% FOR keypart IN part -%]
+    <tr class="record">
+     <td class="pubqr">
+      <img class="pubqr" src="[% keypart.addressqr %]"/>
+     </td>
+     <td>
+      <table class="inner">
+       <tr class="addrtext">
+        <td>
+         <div class="addrtext">
+          <span class="label">Address: </span>
+          <span class="output">[% keypart.address %]</span>
+         </div>
+        </td>
+       </tr>
+       <tr>
+        <td class="wif">
+         <div class="wiftext">
+          <span class="label wif">
+           WIF private key share [% keypart.partno %] of [% d.N %] ([% d.M %] required in total):
+          </span>
+          <br/>
+          <span class="output wif">[% keypart.key %]</span>
+         </div>
+        </td>
+       </tr>
+      </table>
+     </td>
+     <td>
+      <img class="privqr" src="[% keypart.keyqr %]"/>
+     </td>
+    </tr>
+    <tr class="sep"></tr>
+    [% END -%]
+   </table>
+  </div>
+[% END -%]
+ </body>
+</html>
+EOT
+
+## Some defaults.
+
+my $x = 1;
+my $m = 2;
+my $name;
+
+## Parse command line.
+
+GetOptions('n|name' => \$name) or pod2usage(-exitval => 64);
+
+if (exists($ARGV[0])) {
+    $x = shift @ARGV;
+}
+$x =~ /^\d+$/ or pod2usage(
+    -exitval => 64, -message => "X must be an integer (got $x)"
+);
+$x > 0 or pod2usage(-exitval => 64, -message => "X must be > 0");
+
+if (exists($ARGV[0])) {
+    $m = shift @ARGV;
+}
+$m =~ /^\d+$/ or pod2usage(
+    -exitval => 64, -message => "M must be an integer (got $m)"
+);
+$m < 2 and pod2usage(
+    -exitval => 64, -message => "M must be at least 2 (got $m)"
+);
+
+my $n = $m + 1;
+
+if (exists($ARGV[0])) {
+    $n = shift @ARGV;
+}
+$n =~ /^\d+$/ or pod2usage(
+    -exitval => 64, -message => "N must be an integer (got $n)"
+);
+$n < 2 and pod2usage(
+    -exitval => 64, -message => "N must be at least 2 (got $n)"
+);
+$m > $m and pod2usage(-exitval => 64, -message => "M must be <= N");
+
+@ARGV and pod2usage(-exitval => 64, -message => "Extra arguments: @ARGV");
+
+my @btcgenkey = ('btcgenkey', $x);
+my @btcaddr = ('btcaddr');
+#my $btcgenkeyin = "";
+#my $btcaddrout;
+
+pipe(my $btcaddrin, my $btcgenkeyout);
+
+if (fork) {
+    close $btcgenkeyout or die;
+    # read from $btcaddrin below
+}
+else {
+    # FIXME: catch exit codes
+    close $btcaddrin;
+    pipe(my $readbtcaddrout, my $writebtcaddrout);
+    # writer: btcgenkey
+    if (fork) {
+        close $btcgenkeyout;
+        close $readbtcaddrout;
+	STDOUT->fdopen(fileno($writebtcaddrout), 'w') or die;
+	exec(@btcgenkey) or die;
+    }
+    # btcaddr: reads from btcgenkey, writes to master perl program
+    else {
+        close $writebtcaddrout;
+	STDIN->fdopen(fileno($readbtcaddrout), 'r') or die;
+	STDOUT->fdopen(fileno($btcgenkeyout), 'w') or die;
+	exec(@btcaddr) or die;
+    }
+}
+
+my @walletparts; # Size $n
+my @addresses;   # Size $x
+my @ttparts;
+my $keycount = 0;
+while (<$btcaddrin>) {
+    my ($wif, $addr) = split;
+    push @addresses, $addr;
+
+    my @wifparts = ssss($wif, $m, $n);
+    for (0..$#wifparts) {
+        $walletparts[$_][$keycount] = $wifparts[$_];
+        # Each member of @walletparts ends up size $x.
+
+        # For TT (not sure if we'll continue to use TT)
+        $ttparts[$_][$keycount]{address} = $addr;
+	$ttparts[$_][$keycount]{addressqr} = pngdatauri(qrcode($addr));
+	$ttparts[$_][$keycount]{keyqr} = pngdatauri(qrcode($wifparts[$_]));
+	$ttparts[$_][$keycount]{partno} = $_ + 1;
+
+        my $wif_browser = "";
+	my $step = 52;
+	for (my $i=0; $i < length($wifparts[$_]); $i += $step) {
+            $wif_browser .= substr($wifparts[$_], $i, $step) . "<br/>";
+	}
+	$ttparts[$_][$keycount]{key} = $wif_browser;
+	
+    }
+
+    $keycount++;
+}
+
+my $t = Template->new(STRICT => 1);
+
+$t->process(
+    \$doc,
+    {
+        d => {
+            name => $name,
+            keys => $x,
+            M    => $m,
+            N    => $n,
+            parts => [@ttparts],
+        },
+    },
+    $STDOUT,
+) or die $t->error;
+exit;
+
+# Each sheet has a part of the wallet on it.
+for my $walletpart (@walletparts) {
+    for (my $keyslotno = 0; $keyslotno < @addresses; $keyslotno++) {
+        my $address = $addresses[$keyslotno];
+        my $keypart = $walletpart->[$keyslotno];
+	section($address, $keypart);
+    }
+}
+
+sub section {
+    my ($addr, $kp) = @_;
+    my $u = URI->new("data:");
+    $u->media_type('image/png');
+
+    $u->data(qrcode($addr));
+    print "<img src='$u'/>\n";
+}
+
+sub pngdatauri {
+    my ($data) = @_;
+
+    my $u = URI->new("data:");
+    $u->media_type('image/png');
+    $u->data($data);
+    return "$u";
+}
+
+sub qrcode {
+    # Looked at Imager::QRCode.  Couldn't get any output.  API spec doesn't
+    # mention error handling.  So running qrencode(1) instead.
+
+    my ($data) = @_;
+
+    pipe(my $qrout_r, my $qrout_w) or die;
+    pipe(my $qrin_r, my $qrin_w) or die;
+
+    if (fork) {
+        close $qrin_r or die;
+	close $qrout_w or die;
+	if (fork) {
+	    # Parent process.
+	    close $qrin_w or die;
+	    my $data = read_file($qrout_r);
+	    # say "waiting 1";
+	    while (wait != -1) {
+	        # say "waiting 2";
+	        if ($?) {
+		    die "child exited with error " . ($?>>8);
+		}
+		else {
+		    # say "count me: does auto reaping happen";
+		}
+	    }
+	    return $data;
+	}
+	# Write data to qrencode.
+	else {
+	    print $qrin_w $data or die;
+	    exit;
+	}
+    }
+    else {
+	# qrencode
+	close $qrout_r or die;
+	close $qrin_w or die;
+	STDOUT->fdopen(fileno($qrout_w), 'w') or die;
+	STDIN->fdopen(fileno($qrin_r), 'r') or die;
+	exec(qw(qrencode -o -)) or die "qrencode: $!";
+
+    }
+}
+
+# Split something into $n parts where it requires $n of the $n parts to 
+# recover.  Returns parts as a list.
+sub ssss {
+    my ($secret, $m, $n) = @_;
+
+    my @ssss = ('ssss-split', '-t', $m, '-n', $n, '-q');
+    my $ssssin = IO::Pipe->new;
+    my $ssssout = IO::Pipe->new;
+    if (fork) {
+        $ssssin->writer;
+	$ssssout->reader;
+	if (fork) {
+	    undef $ssssin;
+	    my @lines = <$ssssout>;
+	    @lines == $n or die "expecting $n shares, got " . scalar(@lines);
+	    map { chomp } @lines;
+	    while (wait != -1) {
+	        # say "waiting 2";
+	        if ($?) {
+		    die "child exited with error " . ($?>>8);
+		}
+	    }
+	    return @lines;
+	}
+	else {
+	    undef $ssssout;
+	    print $ssssin $secret;
+	    exit;
+	}
+    }
+    else {
+        $ssssin->reader;
+	$ssssout->writer;
+	STDIN->fdopen(fileno($ssssin), 'r') or die;
+	STDOUT->fdopen(fileno($ssssout), 'w') or die;
+        exec(@ssss) or die "$!: @ssss";
+    }
+}
+
