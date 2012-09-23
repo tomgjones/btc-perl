@@ -1,0 +1,15 @@
+Source: btc-perl
+Section: perl
+Priority: optional
+Build-Depends: debhelper (>= 7)
+Build-Depends-Indep: perl
+Maintainer: Tom Jones <tom@oxix.org>
+Standards-Version: 3.9.1
+Homepage: http://search.cpan.org/dist/btc/
+
+Package: btc-perl
+Architecture: all
+Depends: ${misc:Depends}, ${perl:Depends}, libbitcoin-perl, ssss,
+  qrencode, libtemplate-perl, liburi-perl, libfile-slurp-perl
+Description: Command-line bitcoin tools
+Provides: btc
