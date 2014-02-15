@@ -8,5 +8,9 @@ WriteMakefile(
   LICENSE  => 'Apache',
   NAME     => 'App::btc',
   EXE_FILES => [glob("bin/*")],
+  PREREQ_PM => {
+    "Bitcoin::Address" => 0,
+    "Bitcoin::Key" => 0,
+  },
 );
 
